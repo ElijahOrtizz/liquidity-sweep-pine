@@ -1,0 +1,321 @@
+// ============================================================================
+// LSD-15  ·  Liquidity Sweep Detector
+// ============================================================================
+// Author      : Stryde
+// Version     : 2.0.0
+// Released    : 2026
+// Timeframe   : 15M primary · compatible with 5M and 1H
+// License     : MIT
+//
+// ── THEORETICAL BASIS ───────────────────────────────────────────────────────
+// Liquidity sweeps are a structural market dynamic rooted in order-flow theory.
+// Retail participants systematically place stop-loss orders just beyond visible
+// swing highs and lows — creating predictable concentrations of resting orders
+// at those price levels. Institutional participants exploit this by briefly
+// driving price through those levels to trigger the stops, absorb the resulting
+// liquidity, and then reverse in their intended direction.
+//
+// The result is a characteristic candlestick pattern: a long wick that
+// penetrates the swing level with the body closing firmly back inside the
+// prior range. This indicator identifies that pattern in real time, with
+// configurable filters to isolate the highest-quality instances.
+//
+// ── DETECTION CRITERIA ──────────────────────────────────────────────────────
+// A valid sweep requires ALL of the following to be true simultaneously:
+//   1. Wick extends beyond the swing high/low by at least sweep_thresh %
+//   2. Candle closes back inside the prior range  (rejection, not breakout)
+//   3. Candle body direction opposes the sweep    (bearish body on high sweep)
+//   4. Reversal strength meets minimum threshold  (body-to-wick ratio)
+//   5. [Optional] Volume above its moving average (institutional footprint)
+//   6. [Optional] EMA trend alignment             (trade with structure)
+//   7. [Optional] RSI not already exhausted       (avoid late entries)
+//
+// ── SIGNAL TIERS ────────────────────────────────────────────────────────────
+// Standard Sweep  : Criteria 1–5 satisfied. Valid entry, moderate conviction.
+// Confluence ★    : Standard sweep + 3-bar post-reversal momentum confirmation.
+//                   Fewer occurrences, measurably higher historical accuracy.
+//
+// ── SYSTEM INTEGRATION ──────────────────────────────────────────────────────
+// LSD-15 operates as the entry-timing layer within the Stryde system:
+//   · CSA-15            — 8-layer momentum confirmation  (directional bias)
+//   · LSD-15            — Liquidity sweep detection      (entry trigger)
+//   · Kalshi Dashboard  — BTC prediction market odds     (macro confirmation)
+//   · TradersPost       — Webhook-to-broker execution    (automation layer)
+//
+// Peak setup: CSA-15 score ≥ 6/8  +  LSD-15 Confluence ★  +  Kalshi ≥ 60%
+//
+// ── ALERTS ──────────────────────────────────────────────────────────────────
+// All alert payloads are JSON-formatted for TradersPost webhook compatibility.
+// ============================================================================
+
+//@version=5
+indicator(
+  title            = "LSD-15 | Liquidity Sweep Detector",
+  shorttitle       = "LSD-15",
+  overlay          = true,
+  max_labels_count = 500,
+  max_lines_count  = 200)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+grp_sweep  = "── Sweep Detection ──────────────────────"
+grp_conf   = "── Confluence Filters ───────────────────"
+grp_visual = "── Display ──────────────────────────────"
+
+// ── Sweep Detection ──────────────────────────────────────────────────────────
+swing_len = input.int(
+  10, "Swing Lookback (bars)", group=grp_sweep,
+  minval=3, maxval=100,
+  tooltip="Window used to identify the swing high and low being monitored. " +
+          "Smaller values track near-term structure; larger values track major levels.")
+
+sweep_thresh = input.float(
+  0.10, "Sweep Threshold (%)", group=grp_sweep,
+  step=0.05, minval=0.0,
+  tooltip="Minimum percentage the wick must penetrate beyond the swing level. " +
+          "Raise to eliminate shallow fakeouts. Lower on low-volatility instruments.")
+
+reversal_pct = input.float(
+  0.30, "Reversal Strength (%)", group=grp_sweep,
+  step=0.05, minval=0.05,
+  tooltip="Minimum percentage the price must reverse from its extreme post-sweep. " +
+          "Quantifies rejection force. Higher values select stronger reversals only.")
+
+use_vol = input.bool(
+  true, "Require Volume Confirmation", group=grp_sweep,
+  tooltip="Demands that volume exceed its moving average on the sweep candle. " +
+          "Above-average volume suggests institutional order flow, not retail noise.")
+vol_len = input.int(
+  20, "Volume MA Length", group=grp_sweep,
+  tooltip="Lookback for the volume baseline. Default 20 matches CSA-15.")
+vol_mult = input.float(
+  1.20, "Volume Surge Multiplier", group=grp_sweep, step=0.05,
+  tooltip="Volume must exceed (Volume MA × multiplier) to pass the surge filter.")
+
+// ── Confluence Filters ────────────────────────────────────────────────────────
+use_ema_conf = input.bool(
+  true, "EMA Trend Alignment", group=grp_conf,
+  tooltip="Suppresses counter-trend sweeps. Bullish sweeps require price above the " +
+          "trend EMA; bearish sweeps require price below it.")
+ema_conf_len = input.int(
+  21, "Trend EMA Length", group=grp_conf,
+  tooltip="Matches the slow EMA in CSA-15 for cross-indicator consistency.")
+
+use_rsi_conf = input.bool(
+  true, "RSI Exhaustion Filter", group=grp_conf,
+  tooltip="Suppresses signals where RSI indicates momentum is already exhausted " +
+          "in the sweep direction — a common source of premature reversals.")
+rsi_len = input.int(14, "RSI Length", group=grp_conf)
+
+// ── Display ───────────────────────────────────────────────────────────────────
+show_levels = input.bool(true, "Show Swing High / Low Lines", group=grp_visual)
+show_zones  = input.bool(true, "Highlight Sweep Candles",     group=grp_visual)
+show_labels = input.bool(true, "Show Entry Labels",           group=grp_visual)
+show_hud    = input.bool(true, "Show Status Table",           group=grp_visual)
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// ── Base indicators ───────────────────────────────────────────────────────────
+vol_ma    = ta.sma(volume, vol_len)
+vol_surge = volume > vol_ma * vol_mult
+ema_conf  = ta.ema(close, ema_conf_len)
+rsi       = ta.rsi(close, rsi_len)
+atr       = ta.atr(14)
+
+// ── Swing structure ───────────────────────────────────────────────────────────
+// [1] offset ensures we reference completed bars only — no repainting
+swing_high = ta.highest(high, swing_len)[1]
+swing_low  = ta.lowest(low,   swing_len)[1]
+
+// Absolute price thresholds a wick must breach to qualify
+thresh_h = swing_high * (1.0 + sweep_thresh / 100.0)
+thresh_l = swing_low  * (1.0 - sweep_thresh / 100.0)
+
+// ── Bearish sweep: wick above swing high, candle body closes back below ───────
+bear_wick     = high >= thresh_h
+bear_close    = close < swing_high
+bear_body     = open > close
+bear_reversal = (high - close) / close * 100.0 >= reversal_pct
+
+raw_bear   = bear_wick and bear_close and bear_body and bear_reversal
+bear_vol   = use_vol      ? vol_surge        : true
+bear_ema   = use_ema_conf ? close < ema_conf : true
+bear_rsi   = use_rsi_conf ? rsi < 65.0       : true
+
+bear_sweep = raw_bear and bear_vol and bear_ema and bear_rsi and barstate.isconfirmed
+
+// ── Bullish sweep: wick below swing low, candle body closes back above ────────
+bull_wick     = low <= thresh_l
+bull_close    = close > swing_low
+bull_body     = close > open
+bull_reversal = (close - low) / close * 100.0 >= reversal_pct
+
+raw_bull   = bull_wick and bull_close and bull_body and bull_reversal
+bull_vol   = use_vol      ? vol_surge        : true
+bull_ema   = use_ema_conf ? close > ema_conf : true
+bull_rsi   = use_rsi_conf ? rsi > 35.0       : true
+
+bull_sweep = raw_bull and bull_vol and bull_ema and bull_rsi and barstate.isconfirmed
+
+// ── Confluence tier ───────────────────────────────────────────────────────────
+// Three consecutive bars confirming the reversal direction indicates sustained
+// directional order flow rather than a momentary spike reversal.
+momentum_up   = close > close[1] and close[1] > close[2]
+momentum_down = close < close[1] and close[1] < close[2]
+
+bull_conf = bull_sweep and momentum_up
+bear_conf = bear_sweep and momentum_down
+
+// ── Quality score (0–4) for label context ────────────────────────────────────
+bull_q = (bull_vol ? 1 : 0) + (bull_ema ? 1 : 0) + (bull_rsi ? 1 : 0) + (momentum_up   ? 1 : 0)
+bear_q = (bear_vol ? 1 : 0) + (bear_ema ? 1 : 0) + (bear_rsi ? 1 : 0) + (momentum_down ? 1 : 0)
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+// ── Trend EMA ─────────────────────────────────────────────────────────────────
+plot(ema_conf,
+  title     = "Trend EMA",
+  color     = color.new(color.orange, 35),
+  linewidth = 1)
+
+// ── Swing levels ──────────────────────────────────────────────────────────────
+plot(show_levels ? swing_high : na,
+  title     = "Swing High",
+  color     = color.new(color.red,  45),
+  style     = plot.style_stepline,
+  linewidth = 1)
+
+plot(show_levels ? swing_low : na,
+  title     = "Swing Low",
+  color     = color.new(color.lime, 45),
+  style     = plot.style_stepline,
+  linewidth = 1)
+
+// ── Bar background ────────────────────────────────────────────────────────────
+bgcolor(
+  show_zones and bull_sweep ? color.new(color.teal,   87) :
+  show_zones and bear_sweep ? color.new(color.orange, 87) : na,
+  title = "Sweep Candle")
+
+// ── Signal shapes ─────────────────────────────────────────────────────────────
+plotshape(bull_sweep,
+  title     = "Bullish Sweep",
+  style     = shape.labelup,
+  location  = location.belowbar,
+  color     = color.new(color.teal,   5),
+  textcolor = color.white,
+  text      = "SWEEP ↑",
+  size      = size.normal)
+
+plotshape(bear_sweep,
+  title     = "Bearish Sweep",
+  style     = shape.labeldown,
+  location  = location.abovebar,
+  color     = color.new(color.orange, 5),
+  textcolor = color.white,
+  text      = "SWEEP ↓",
+  size      = size.normal)
+
+plotshape(bull_conf,
+  title     = "Bullish Confluence ★",
+  style     = shape.star,
+  location  = location.belowbar,
+  color     = color.new(color.lime, 0),
+  size      = size.large)
+
+plotshape(bear_conf,
+  title     = "Bearish Confluence ★",
+  style     = shape.star,
+  location  = location.abovebar,
+  color     = color.new(color.red,  0),
+  size      = size.large)
+
+// ── Entry labels ──────────────────────────────────────────────────────────────
+if show_labels and bull_sweep
+    label.new(
+      bar_index, low - atr * 0.45,
+      text      = (bull_conf ? "★  BULL SWEEP  ·  CONFLUENCE\n" : "▲  BULL SWEEP\n")    +
+                  "Swept Level  :  " + str.tostring(math.round(swing_low, 2)) + "\n"    +
+                  "Wick Low     :  " + str.tostring(math.round(low,       2)) + "\n"    +
+                  "Quality      :  " + str.tostring(bull_q) + " / 4",
+      color     = bull_conf ? color.new(color.lime, 8) : color.new(color.teal, 10),
+      textcolor = color.black,
+      style     = label.style_label_up,
+      size      = size.small)
+
+if show_labels and bear_sweep
+    label.new(
+      bar_index, high + atr * 0.45,
+      text      = (bear_conf ? "★  BEAR SWEEP  ·  CONFLUENCE\n" : "▼  BEAR SWEEP\n")   +
+                  "Swept Level  :  " + str.tostring(math.round(swing_high, 2)) + "\n"  +
+                  "Wick High    :  " + str.tostring(math.round(high,       2)) + "\n"  +
+                  "Quality      :  " + str.tostring(bear_q) + " / 4",
+      color     = bear_conf ? color.new(color.red, 8) : color.new(color.orange, 10),
+      textcolor = color.white,
+      style     = label.style_label_down,
+      size      = size.small)
+
+// ── Status table ──────────────────────────────────────────────────────────────
+if show_hud and barstate.islast
+    var table hud = table.new(
+      position.bottom_right, 2, 9,
+      border_width = 1,
+      border_color = color.new(color.gray, 60))
+
+    c_head = color.new(color.gray,  55)
+    c_cell = color.new(color.black, 70)
+    c_yes  = color.new(color.teal,  30)
+    c_no   = color.new(color.red,   45)
+    c_txt  = color.white
+    sz     = size.tiny
+
+    table.cell(hud, 0, 0, "LSD-15  ·  MARKET STATE", bgcolor=c_head, text_color=c_txt, text_size=size.small)
+    table.cell(hud, 1, 0, " ",                         bgcolor=c_head, text_color=c_txt, text_size=size.small)
+
+    labels = array.from("Swing High", "Swing Low", "Volume Surge", "RSI", "Price vs EMA", "Last Signal", "Quality")
+    values = array.from(
+      str.tostring(math.round(swing_high, 2)),
+      str.tostring(math.round(swing_low,  2)),
+      vol_surge        ? "YES"          : "NO",
+      str.tostring(math.round(rsi, 1)),
+      close > ema_conf ? "ABOVE"        : "BELOW",
+      bull_sweep       ? "BULL SWEEP ▲" : bear_sweep ? "BEAR SWEEP ▼" : "—",
+      bull_sweep       ? str.tostring(bull_q) + " / 4" :
+      bear_sweep       ? str.tostring(bear_q) + " / 4" : "—")
+    colors = array.from(
+      c_cell, c_cell,
+      vol_surge        ? c_yes : c_no,
+      c_cell,
+      close > ema_conf ? c_yes : c_no,
+      bull_sweep       ? c_yes : bear_sweep ? c_no : c_cell,
+      c_cell)
+
+    for i = 0 to 6
+        table.cell(hud, 0, i + 1, array.get(labels, i), bgcolor=c_cell,                     text_color=c_txt, text_size=sz)
+        table.cell(hud, 1, i + 1, array.get(values, i), bgcolor=array.get(colors, i),        text_color=c_txt, text_size=sz)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(bull_sweep,
+  title   = "LSD-15 · Bullish Sweep",
+  message = '{"action":"buy","signal":"sweep","ticker":"{{ticker}}","price":"{{close}}","swept":"low","tf":"15"}')
+
+alertcondition(bear_sweep,
+  title   = "LSD-15 · Bearish Sweep",
+  message = '{"action":"sell","signal":"sweep","ticker":"{{ticker}}","price":"{{close}}","swept":"high","tf":"15"}')
+
+alertcondition(bull_conf,
+  title   = "LSD-15 · Bullish Sweep + Confluence ★",
+  message = '{"action":"buy","signal":"sweep_confluence","ticker":"{{ticker}}","price":"{{close}}","confidence":"high","tf":"15"}')
+
+alertcondition(bear_conf,
+  title   = "LSD-15 · Bearish Sweep + Confluence ★",
+  message = '{"action":"sell","signal":"sweep_confluence","ticker":"{{ticker}}","price":"{{close}}","confidence":"high","tf":"15"}')
