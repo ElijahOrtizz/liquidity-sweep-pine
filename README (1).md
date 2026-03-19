@@ -152,4 +152,4 @@ stryde/
 
 ## License
 
-MIT — free to use, modify, and build on.
+Free to use, modify, and build on.
